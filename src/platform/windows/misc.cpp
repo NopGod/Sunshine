@@ -1505,6 +1505,8 @@ namespace platf {
     return cmbuflen;
   }
 
+  static std::atomic_bool source_pktinfo_disabled {false};  ///< Use normal route-based source selection after Windows rejects explicit packet information.
+
   // Use UDP segmentation offload if it is supported by the OS. If the NIC is capable, this will use
   // hardware acceleration to reduce CPU usage. Support for USO was introduced in Windows 10 20H1.
   bool send_batch(const batched_send_info_t &send_info) {
@@ -1562,12 +1564,14 @@ namespace platf {
     msg.Control.buf = cmbuf.data();
     msg.Control.len = cmbuf.size();
 
-    auto cmbuflen = populate_source_pktinfo(msg, send_info.source_address);
+    auto cmbuflen = ULONG {0};
+    if (!source_pktinfo_disabled.load(std::memory_order_relaxed)) {
+      cmbuflen = populate_source_pktinfo(msg, send_info.source_address);
+    }
 
     if (send_info.block_count > 1) {
+      auto cm = cmbuflen ? WSA_CMSG_NXTHDR(&msg, WSA_CMSG_FIRSTHDR(&msg)) : WSA_CMSG_FIRSTHDR(&msg);
       cmbuflen += WSA_CMSG_SPACE(sizeof(DWORD));
-
-      auto cm = WSA_CMSG_NXTHDR(&msg, WSA_CMSG_FIRSTHDR(&msg));
       cm->cmsg_level = IPPROTO_UDP;
       cm->cmsg_type = UDP_SEND_MSG_SIZE;
       cm->cmsg_len = WSA_CMSG_LEN(sizeof(DWORD));
@@ -1618,13 +1622,25 @@ namespace platf {
     msg.Control.buf = cmbuf.data();
     msg.Control.len = cmbuf.size();
 
-    auto cmbuflen = populate_source_pktinfo(msg, send_info.source_address);
+    auto use_source_pktinfo = !source_pktinfo_disabled.load(std::memory_order_relaxed);
+    auto cmbuflen = use_source_pktinfo ? populate_source_pktinfo(msg, send_info.source_address) : ULONG {0};
 
     msg.Control.len = cmbuflen;
 
     DWORD bytes_sent;
     if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR) {
       auto winerr = WSAGetLastError();
+
+      if (winerr == WSAEINVAL && use_source_pktinfo) {
+        msg.Control.len = 0;
+        if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR) {
+          source_pktinfo_disabled.store(true, std::memory_order_relaxed);
+          BOOST_LOG(warning) << "Windows rejected source packet info for "sv << send_info.source_address << "; using route-selected source addresses for UDP sends"sv;
+          return true;
+        }
+        winerr = WSAGetLastError();
+      }
+
       BOOST_LOG(warning) << "WSASendMsg() failed: "sv << winerr;
       return false;
     }
