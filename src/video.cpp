@@ -2444,6 +2444,9 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
 
+    logging::time_delta_periodic_logger capture_to_encode_latency_logger(debug, "Capture to encode start latency");
+    logging::time_delta_periodic_logger encode_latency_logger(debug, "Video encode latency");
+
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
       // even if we timeout waiting on the first frame. This is a relatively large
@@ -2502,7 +2505,16 @@ namespace video {
         break;
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+      if (frame_timestamp) {
+        capture_to_encode_latency_logger.first_point(*frame_timestamp);
+        capture_to_encode_latency_logger.second_point_now_and_log();
+      }
+
+      encode_latency_logger.first_point_now();
+      auto encode_result = encode(frame_nr++, *session, packets, channel_data, frame_timestamp);
+      encode_latency_logger.second_point_now_and_log();
+
+      if (encode_result) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
